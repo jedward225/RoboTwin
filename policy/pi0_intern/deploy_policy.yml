@@ -1,0 +1,33 @@
+# Pi0 (InternData) Policy Configuration for RoboTwin
+# ================================================
+
+# Basic config (required by RoboTwin)
+task_name: null
+policy_name: pi0_intern
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+# Device configuration
+device: cuda:0
+
+# Model architecture
+action_horizon: 10          # Number of future actions to predict
+action_dim: 32              # Padded action dimension for pi0
+max_token_len: 48           # Max token length for language instruction
+
+# Arm mode for dual-arm to single-arm mapping
+# Options: 'left', 'right', 'both'
+# - 'left': Control only left arm (right arm stays at initial position)
+# - 'right': Control only right arm
+# - 'both': Mirror actions to both arms
+arm_mode: left
+
+# Checkpoint configuration
+# Checkpoint path will be: {checkpoint_dir}/{task_name}/{ckpt_setting}/model.safetensors
+# Or directly: {ckpt_setting} if it's a full path
+checkpoint_dir: ./policy/pi0_intern/checkpoints
+
+# Inference settings
+num_denoising_steps: 10     # Flow matching denoising steps
