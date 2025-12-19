@@ -17,7 +17,12 @@ action_horizon: 10          # Number of future actions to predict
 action_dim: 32              # Padded action dimension for pi0
 max_token_len: 48           # Max token length for language instruction
 
-# Arm mode for dual-arm to single-arm mapping
+# Embodiment type
+# Options: 'franka' for single-arm Franka-Panda, 'dual_arm' for aloha-agilex
+# This is auto-detected from task config, but can be explicitly set
+# embodiment: franka
+
+# Arm mode for dual-arm to single-arm mapping (only used when embodiment=dual_arm)
 # Options: 'left', 'right', 'both'
 # - 'left': Control only left arm (right arm stays at initial position)
 # - 'right': Control only right arm

@@ -52,6 +52,7 @@ class Pi0InternPolicy:
         max_token_len: int = 48,
         image_size: int = 224,
         arm_mode: str = 'left',  # 'left', 'right', or 'both'
+        embodiment: str = 'dual_arm',  # 'franka' for single-arm, 'dual_arm' for aloha
     ):
         self.device = torch.device(device)
         self.action_horizon = action_horizon
@@ -59,14 +60,19 @@ class Pi0InternPolicy:
         self.max_token_len = max_token_len
         self.image_size = image_size
         self.arm_mode = arm_mode
+        self.embodiment = embodiment
 
         # InternData action mapping (8 dim)
         # [joint_0, joint_1, ..., joint_6, gripper_openness]
         self.intern_action_dim = 8
 
-        # RoboTwin action mapping (14 dim)
-        # [left_arm:7, left_gripper:1, right_arm:7, right_gripper:1]
-        self.robotwin_action_dim = 14
+        # RoboTwin action mapping
+        if embodiment == 'franka':
+            # Single-arm Franka: 8 dim [arm:7, gripper:1]
+            self.robotwin_action_dim = 8
+        else:
+            # Dual-arm (aloha): 14 dim [left_arm:7, left_gripper:1, right_arm:7, right_gripper:1]
+            self.robotwin_action_dim = 14
 
         # Initialize tokenizer
         self.tokenizer = PaligemmaTokenizer(max_len=max_token_len)
@@ -130,23 +136,32 @@ class Pi0InternPolicy:
 
     def _robotwin_qpos_to_intern_state(self, qpos: np.ndarray) -> np.ndarray:
         """
-        Convert RoboTwin qpos (16 dim) to InternData state format (14 dim -> padded to 32).
+        Convert RoboTwin qpos to InternData state format (padded to 32).
 
-        RoboTwin qpos: [left_arm:7, left_gripper:1, right_arm:7, right_gripper:1]
+        For franka (single-arm):
+            RoboTwin qpos: [arm:7, gripper:1] = 8 dim
+        For dual_arm (aloha):
+            RoboTwin qpos: [left_arm:7, left_gripper:1, right_arm:7, right_gripper:1] = 16 dim
+
         InternData state: [joint_position:7, gripper_position:1, gripper_pose:6]
-
         Note: InternData doesn't have explicit gripper_pose, so we pad with zeros.
         """
-        if self.arm_mode == 'left':
-            joint_pos = qpos[:7]  # left arm joints
-            gripper_pos = qpos[7:8]  # left gripper
-        elif self.arm_mode == 'right':
-            joint_pos = qpos[8:15]  # right arm joints
-            gripper_pos = qpos[15:16]  # right gripper
-        else:
-            # For 'both', use left arm as primary
+        if self.embodiment == 'franka':
+            # Single-arm Franka: qpos is 8 dim
             joint_pos = qpos[:7]
             gripper_pos = qpos[7:8]
+        else:
+            # Dual-arm (aloha): qpos is 16 dim
+            if self.arm_mode == 'left':
+                joint_pos = qpos[:7]  # left arm joints
+                gripper_pos = qpos[7:8]  # left gripper
+            elif self.arm_mode == 'right':
+                joint_pos = qpos[8:15]  # right arm joints
+                gripper_pos = qpos[15:16]  # right gripper
+            else:
+                # For 'both', use left arm as primary
+                joint_pos = qpos[:7]
+                gripper_pos = qpos[7:8]
 
         # Create state in InternData format
         # [joint_position:7, gripper_position:1, gripper_pose:6 (zeros)]
@@ -159,17 +174,26 @@ class Pi0InternPolicy:
 
     def _intern_action_to_robotwin(self, action: np.ndarray) -> np.ndarray:
         """
-        Convert InternData action (8 dim) to RoboTwin action (14 dim).
+        Convert InternData action (8 dim) to RoboTwin action format.
 
         InternData action: [joint_position:7, gripper_openness:1]
-        RoboTwin action: [left_arm:7, left_gripper:1, right_arm:7, right_gripper:1]
+
+        For franka (single-arm): output 8 dim [arm:7, gripper:1]
+        For dual_arm (aloha): output 14 dim [left_arm:7, left_gripper:1, right_arm:7, right_gripper:1]
         """
         # Extract from padded action
         joint_action = action[:7]
         gripper_action = action[7]
 
-        # Create RoboTwin action
-        robotwin_action = np.zeros(self.robotwin_action_dim, dtype=np.float32)
+        if self.embodiment == 'franka':
+            # Single-arm Franka: direct mapping
+            robotwin_action = np.zeros(8, dtype=np.float32)
+            robotwin_action[:7] = joint_action
+            robotwin_action[7] = gripper_action
+            return robotwin_action
+
+        # Dual-arm (aloha) mode
+        robotwin_action = np.zeros(14, dtype=np.float32)
 
         if self.arm_mode == 'left':
             robotwin_action[:7] = joint_action
@@ -318,6 +342,7 @@ def get_model(usr_args: dict):
             - checkpoint_dir: Base directory for checkpoints
             - device: CUDA device
             - arm_mode: 'left', 'right', or 'both'
+            - embodiment: 'franka' or 'dual_arm' (auto-detected from left_arm_dim)
     """
     global _model_instance
 
@@ -349,6 +374,28 @@ def get_model(usr_args: dict):
             "\n".join(f"  - {p}" for p in possible_paths)
         )
 
+    # Auto-detect embodiment from arm dimensions
+    # franka-panda has 7 joints, aloha has 7+7=14
+    left_arm_dim = usr_args.get('left_arm_dim', 7)
+    right_arm_dim = usr_args.get('right_arm_dim', 7)
+
+    # Check if this is single-arm (franka) or dual-arm (aloha)
+    # If right_arm_dim exists and > 0, it's dual-arm
+    if right_arm_dim > 0 and left_arm_dim > 0:
+        # Check the embodiment config name
+        embodiment_name = usr_args.get('embodiment_name', '')
+        if 'franka' in embodiment_name.lower():
+            embodiment = 'franka'
+        else:
+            embodiment = 'dual_arm'
+    else:
+        embodiment = 'franka'
+
+    # Allow explicit override
+    embodiment = usr_args.get('embodiment', embodiment)
+
+    print(f"Using embodiment: {embodiment} (left_arm_dim={left_arm_dim}, right_arm_dim={right_arm_dim})")
+
     _model_instance = Pi0InternPolicy(
         checkpoint_path=checkpoint_path,
         device=usr_args.get('device', 'cuda:0'),
@@ -356,6 +403,7 @@ def get_model(usr_args: dict):
         action_dim=usr_args.get('action_dim', 32),
         max_token_len=usr_args.get('max_token_len', 48),
         arm_mode=usr_args.get('arm_mode', 'left'),
+        embodiment=embodiment,
     )
 
     return _model_instance
