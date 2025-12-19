@@ -240,6 +240,9 @@ def eval_policy(task_name,
                 TASK_ENV.close_env()
                 now_seed += 1
                 args["render_freq"] = render_freq
+                # print("error occurs !")
+                import traceback
+                traceback.print_exc()
                 print("error occurs !")
                 continue
 
