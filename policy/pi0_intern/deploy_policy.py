@@ -185,14 +185,8 @@ class Pi0InternPolicy:
         joint_action = action[:7]
         gripper_action = action[7]
 
-        if self.embodiment == 'franka':
-            # Single-arm Franka: direct mapping
-            robotwin_action = np.zeros(8, dtype=np.float32)
-            robotwin_action[:7] = joint_action
-            robotwin_action[7] = gripper_action
-            return robotwin_action
-
-        # Dual-arm (aloha) mode
+        # Always output 14-dim actions for RoboTwin (even for franka)
+        # RoboTwin's take_action expects dual-arm format
         robotwin_action = np.zeros(14, dtype=np.float32)
 
         if self.arm_mode == 'left':
@@ -269,16 +263,6 @@ class Pi0InternPolicy:
 
         # Convert to numpy and map to RoboTwin format
         actions_np = actions.cpu().numpy()[0]  # (action_horizon, 32)
-
-        # Debug: print first action
-        if not hasattr(self, '_debug_count'):
-            self._debug_count = 0
-        if self._debug_count < 3:
-            print(f"\n[DEBUG] Step {self._debug_count}")
-            print(f"  Input state (first 8): {obs['state'][:8]}")
-            print(f"  Model raw output (first 8): {actions_np[0, :8]}")
-            print(f"  Instruction: {self.current_instruction}")
-            self._debug_count += 1
 
         # Map each action to RoboTwin format
         robotwin_actions = []
