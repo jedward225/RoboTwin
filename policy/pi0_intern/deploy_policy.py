@@ -1,15 +1,21 @@
 """
-Pi0 Policy Adapter for RoboTwin Evaluation
+Pi0 Policy Adapter for RoboTwin Evaluation (Delta Joints Format)
 
-This adapter allows evaluating pi0 models (trained on InternData) in RoboTwin.
+This adapter allows evaluating pi0 models (trained on InternData with delta joints)
+in RoboTwin.
 
-IMPORTANT NOTE:
-- InternData uses single-arm Franka robot: action_dim = 8 (7 joints + 1 gripper)
-- RoboTwin uses dual-arm robot: action_dim = 14 (left_arm:7 + left_gripper:1 + right_arm:7 + right_gripper:1)
+Data Format (matching InternVLA-M1):
+- State: [joints(7), gripper_openness(1)] = 8 dims
+- Action: [delta_joints(7), gripper_openness(1)] = 8 dims
+- delta_joints = target_joints - current_joints
 
-Adaptation Strategy:
-- For single-arm tasks: Use only left arm, right arm stays at initial position
-- For dual-arm tasks: Need to retrain model with dual-arm data
+Key Pipeline:
+1. Get current qpos from RoboTwin
+2. Normalize state using training stats
+3. Model outputs normalized delta actions
+4. Denormalize to get real delta
+5. Compute target = current + delta
+6. Send target to RoboTwin
 
 Usage:
     cd /home/jjliu/HistoryAwareVLA/third_party/RoboTwin
@@ -18,6 +24,7 @@ Usage:
 
 import sys
 import os
+import json
 import numpy as np
 import torch
 import cv2
@@ -31,16 +38,18 @@ sys.path.insert(0, os.path.join(REPO_ROOT, 'src'))
 
 from openpi.models.tokenizer import PaligemmaTokenizer
 from openpi.models import model as _model
+from openpi.training.intern_data_loader import NormStats, load_norm_stats
 
 
 class Pi0InternPolicy:
     """
-    Pi0 policy wrapper for RoboTwin evaluation.
+    Pi0 policy wrapper for RoboTwin evaluation with delta joints.
 
     Handles:
-    - Image preprocessing (resize, normalize)
-    - State/action dimension mapping
-    - Action chunk execution
+    - Image preprocessing (resize)
+    - State normalization (min-max to [-1, 1])
+    - Delta action denormalization
+    - Convert delta to absolute joint positions
     """
 
     def __init__(
@@ -63,19 +72,19 @@ class Pi0InternPolicy:
         self.embodiment = embodiment
 
         # InternData action mapping (8 dim)
-        # [joint_0, joint_1, ..., joint_6, gripper_openness]
+        # [delta_joint_0, delta_joint_1, ..., delta_joint_6, gripper_openness]
         self.intern_action_dim = 8
 
-        # RoboTwin action mapping
-        if embodiment == 'franka':
-            # Single-arm Franka: 8 dim [arm:7, gripper:1]
-            self.robotwin_action_dim = 8
-        else:
-            # Dual-arm (aloha): 14 dim [left_arm:7, left_gripper:1, right_arm:7, right_gripper:1]
-            self.robotwin_action_dim = 14
+        # RoboTwin action mapping: always 16 dim
+        # [left_arm:7, left_gripper:1, right_arm:7, right_gripper:1]
+        self.robotwin_action_dim = 16
 
         # Initialize tokenizer
         self.tokenizer = PaligemmaTokenizer(max_len=max_token_len)
+
+        # Load normalization stats
+        self.norm_stats = None
+        self._load_norm_stats(checkpoint_path)
 
         # Load model
         self._load_model(checkpoint_path)
@@ -84,6 +93,23 @@ class Pi0InternPolicy:
         self.obs_history = []
         self.action_buffer = []
         self.current_instruction = None
+        self.current_qpos = None  # Store current joint positions for delta computation
+
+    def _load_norm_stats(self, checkpoint_path: str):
+        """Load normalization statistics from checkpoint directory."""
+        if os.path.isdir(checkpoint_path):
+            norm_stats_path = os.path.join(checkpoint_path, "norm_stats.json")
+        else:
+            norm_stats_path = os.path.join(os.path.dirname(checkpoint_path), "norm_stats.json")
+
+        if os.path.exists(norm_stats_path):
+            self.norm_stats = load_norm_stats(norm_stats_path)
+            print(f"Loaded norm_stats from: {norm_stats_path}")
+            print(f"  State range: [{self.norm_stats['state'].min[:8]}] to [{self.norm_stats['state'].max[:8]}]")
+            print(f"  Action range: [{self.norm_stats['actions'].min[:8]}] to [{self.norm_stats['actions'].max[:8]}]")
+        else:
+            print(f"WARNING: norm_stats.json not found at {norm_stats_path}")
+            print("  Model outputs will NOT be denormalized!")
 
     def _load_model(self, checkpoint_path: str):
         """Load pi0 model from checkpoint."""
@@ -107,7 +133,6 @@ class Pi0InternPolicy:
 
         # Load weights
         if os.path.isdir(checkpoint_path):
-            # Checkpoint directory format
             model_path = os.path.join(checkpoint_path, "model.safetensors")
         else:
             model_path = checkpoint_path
@@ -120,88 +145,94 @@ class Pi0InternPolicy:
 
         self.model.eval()
 
-    def _preprocess_image(self, rgb: np.ndarray) -> np.ndarray:
+    def _normalize_state(self, state: np.ndarray) -> np.ndarray:
+        """Normalize state to [-1, 1] using training statistics."""
+        if self.norm_stats is None or "state" not in self.norm_stats:
+            return state
+
+        # Only normalize first 8 dims (joints + gripper)
+        state_8d = state[:8].copy()
+        normalized = self.norm_stats["state"].normalize_minmax(state_8d)
+
+        # Pad to action_dim
+        result = np.zeros(self.action_dim, dtype=np.float32)
+        result[:8] = normalized
+        return result
+
+    def _denormalize_action(self, action: np.ndarray) -> np.ndarray:
+        """Denormalize action from [-1, 1] to real values."""
+        if self.norm_stats is None or "actions" not in self.norm_stats:
+            return action[:8]
+
+        # Only denormalize first 8 dims
+        action_8d = action[:8].copy()
+        return self.norm_stats["actions"].denormalize_minmax(action_8d)
+
+    def _qpos_to_state(self, qpos: np.ndarray, gripper_val: float = None) -> np.ndarray:
         """
-        Preprocess image for pi0.
+        Convert RoboTwin qpos to state format (8 dims, NOT normalized).
+
+        State format: [joints(7), gripper_openness(1)]
 
         Args:
-            rgb: (H, W, 3) uint8 image
-
-        Returns:
-            (H', W', 3) uint8 image resized to image_size
-        """
-        if rgb.shape[0] != self.image_size or rgb.shape[1] != self.image_size:
-            rgb = cv2.resize(rgb, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
-        return rgb
-
-    def _robotwin_qpos_to_intern_state(self, qpos: np.ndarray) -> np.ndarray:
-        """
-        Convert RoboTwin qpos to InternData state format (padded to 32).
-
-        For franka (single-arm):
-            RoboTwin qpos: [arm:7, gripper:1] = 8 dim
-        For dual_arm (aloha):
-            RoboTwin qpos: [left_arm:7, left_gripper:1, right_arm:7, right_gripper:1] = 16 dim
-
-        InternData state: [joint_position:7, gripper_position:1, gripper_pose:6]
-        Note: InternData doesn't have explicit gripper_pose, so we pad with zeros.
+            qpos: Joint positions from RoboTwin (16 dim for dual-arm)
+            gripper_val: Gripper value (0-1)
         """
         if self.embodiment == 'franka':
-            # Single-arm Franka: qpos is 8 dim
             joint_pos = qpos[:7]
-            gripper_pos = qpos[7:8]
+            raw_gripper = qpos[7] if gripper_val is None else gripper_val
         else:
             # Dual-arm (aloha): qpos is 16 dim
             if self.arm_mode == 'left':
-                joint_pos = qpos[:7]  # left arm joints
-                gripper_pos = qpos[7:8]  # left gripper
-            elif self.arm_mode == 'right':
-                joint_pos = qpos[8:15]  # right arm joints
-                gripper_pos = qpos[15:16]  # right gripper
-            else:
-                # For 'both', use left arm as primary
                 joint_pos = qpos[:7]
-                gripper_pos = qpos[7:8]
+                raw_gripper = qpos[7] if gripper_val is None else gripper_val
+            elif self.arm_mode == 'right':
+                joint_pos = qpos[8:15]
+                raw_gripper = qpos[15] if gripper_val is None else gripper_val
+            else:
+                joint_pos = qpos[:7]
+                raw_gripper = qpos[7] if gripper_val is None else gripper_val
 
-        # Create state in InternData format
-        # [joint_position:7, gripper_position:1, gripper_pose:6 (zeros)]
-        state = np.zeros(self.action_dim, dtype=np.float32)
+        # State: [joints(7), gripper(1)]
+        state = np.zeros(8, dtype=np.float32)
         state[:7] = joint_pos
-        state[7:8] = gripper_pos
-        # state[8:14] = gripper_pose (zeros for now)
+        state[7] = raw_gripper  # Keep as 0-1, same as training
 
         return state
 
-    def _intern_action_to_robotwin(self, action: np.ndarray) -> np.ndarray:
+    def _delta_to_robotwin_action(self, delta_action: np.ndarray, current_joints: np.ndarray) -> np.ndarray:
         """
-        Convert InternData action (8 dim) to RoboTwin action format.
+        Convert delta action to RoboTwin absolute action format.
 
-        InternData action: [joint_position:7, gripper_openness:1]
+        Args:
+            delta_action: [delta_joints(7), gripper_openness(1)]
+            current_joints: Current joint positions (7,)
 
-        For franka (single-arm): output 8 dim [arm:7, gripper:1]
-        For dual_arm (aloha): output 14 dim [left_arm:7, left_gripper:1, right_arm:7, right_gripper:1]
+        Returns:
+            robotwin_action: (16,) absolute joint positions for RoboTwin
         """
-        # Extract from padded action
-        joint_action = action[:7]
-        gripper_action = action[7]
+        # Compute target joints
+        delta_joints = delta_action[:7]
+        gripper_action = delta_action[7]
 
-        # Always output 14-dim actions for RoboTwin (even for franka)
-        # RoboTwin's take_action expects dual-arm format
-        robotwin_action = np.zeros(14, dtype=np.float32)
+        target_joints = current_joints + delta_joints
+
+        # Safety clamp gripper to [0, 1]
+        gripper_action = np.clip(gripper_action, 0.0, 1.0)
+
+        # Output 16-dim actions for RoboTwin
+        robotwin_action = np.zeros(16, dtype=np.float32)
 
         if self.arm_mode == 'left':
-            robotwin_action[:7] = joint_action
+            robotwin_action[:7] = target_joints
             robotwin_action[7] = gripper_action
-            # Right arm stays at zero (will use initial position)
         elif self.arm_mode == 'right':
-            robotwin_action[8:15] = joint_action
+            robotwin_action[8:15] = target_joints
             robotwin_action[15] = gripper_action
-            # Left arm stays at zero
         else:
-            # 'both' - mirror to both arms
-            robotwin_action[:7] = joint_action
+            robotwin_action[:7] = target_joints
             robotwin_action[7] = gripper_action
-            robotwin_action[8:15] = joint_action
+            robotwin_action[8:15] = target_joints
             robotwin_action[15] = gripper_action
 
         return robotwin_action
@@ -211,16 +242,19 @@ class Pi0InternPolicy:
         Run inference and get action chunk.
 
         Args:
-            obs: Encoded observation dict
+            obs: Encoded observation dict with 'state', 'head_cam', etc.
             instruction: Language instruction
 
         Returns:
-            actions: (action_horizon, 14) action chunk for RoboTwin
+            actions: (action_horizon, 16) action chunk for RoboTwin
         """
         if instruction is not None:
             self.current_instruction = instruction
 
-        # Prepare images (already preprocessed)
+        # Store current joint positions for delta computation
+        current_joints = obs["current_joints"]  # (7,)
+
+        # Prepare images
         images = {
             "base_0_rgb": torch.from_numpy(obs["head_cam"]).unsqueeze(0).to(self.device),
             "left_wrist_0_rgb": torch.from_numpy(obs["left_cam"]).unsqueeze(0).to(self.device),
@@ -233,7 +267,7 @@ class Pi0InternPolicy:
             "right_wrist_0_rgb": torch.tensor([True]).to(self.device),
         }
 
-        # Prepare state
+        # Prepare normalized state
         state = torch.from_numpy(obs["state"]).unsqueeze(0).to(torch.float32).to(self.device)
 
         # Tokenize instruction
@@ -254,29 +288,43 @@ class Pi0InternPolicy:
 
         # Run inference
         with torch.no_grad():
-            # sample_actions returns (1, action_horizon, action_dim)
             actions = self.model.sample_actions(
                 device=self.device,
                 observation=observation,
-                num_steps=10,  # denoising steps
+                num_steps=10,
             )
 
-        # Convert to numpy and map to RoboTwin format
+        # Convert to numpy
         actions_np = actions.cpu().numpy()[0]  # (action_horizon, 32)
 
-        # Map each action to RoboTwin format
+        # Process each action: denormalize and convert delta to absolute
         robotwin_actions = []
+        running_joints = current_joints.copy()
+
         for i in range(self.action_horizon):
-            robotwin_action = self._intern_action_to_robotwin(actions_np[i])
+            # Denormalize action
+            delta_action = self._denormalize_action(actions_np[i])
+
+            # Convert delta to absolute
+            robotwin_action = self._delta_to_robotwin_action(delta_action, running_joints)
             robotwin_actions.append(robotwin_action)
 
-        return np.array(robotwin_actions)  # (action_horizon, 14)
+            # Update running joints for next action in chunk
+            if self.arm_mode == 'left':
+                running_joints = robotwin_action[:7]
+            elif self.arm_mode == 'right':
+                running_joints = robotwin_action[8:15]
+            else:
+                running_joints = robotwin_action[:7]
+
+        return np.array(robotwin_actions)
 
     def reset(self):
         """Reset policy state for new episode."""
         self.obs_history = []
         self.action_buffer = []
         self.current_instruction = None
+        self.current_qpos = None
 
 
 # Global model instance
@@ -293,8 +341,10 @@ def encode_obs(observation: dict) -> dict:
     Returns:
         Encoded observation for pi0
     """
+    global _model_instance
+
     # Extract images
-    head_rgb = observation["observation"]["head_camera"]["rgb"]  # (H, W, 3)
+    head_rgb = observation["observation"]["head_camera"]["rgb"]
     left_rgb = observation["observation"]["left_camera"]["rgb"]
     right_rgb = observation["observation"]["right_camera"]["rgb"]
 
@@ -304,40 +354,49 @@ def encode_obs(observation: dict) -> dict:
     right_rgb = cv2.resize(right_rgb, (224, 224), interpolation=cv2.INTER_LINEAR)
 
     # Extract qpos
-    qpos = np.array(observation["joint_action"]["vector"], dtype=np.float32)  # (16,)
+    qpos = np.array(observation["joint_action"]["vector"], dtype=np.float32)
 
-    # Convert qpos to InternData state format
-    global _model_instance
+    # Get gripper value
+    gripper_val = None
+    if "endpose" in observation and observation["endpose"]:
+        if _model_instance is not None and _model_instance.arm_mode == 'right':
+            gripper_val = observation["endpose"].get("right_gripper", None)
+        else:
+            gripper_val = observation["endpose"].get("left_gripper", None)
+
+    # Convert qpos to state format (8 dims, raw)
     if _model_instance is not None:
-        state = _model_instance._robotwin_qpos_to_intern_state(qpos)
+        state_raw = _model_instance._qpos_to_state(qpos, gripper_val=gripper_val)
+        # Get current joints for delta computation
+        if _model_instance.arm_mode == 'left':
+            current_joints = qpos[:7].copy()
+        elif _model_instance.arm_mode == 'right':
+            current_joints = qpos[8:15].copy()
+        else:
+            current_joints = qpos[:7].copy()
+
+        # Normalize state
+        state = _model_instance._normalize_state(state_raw)
     else:
-        # Default: use left arm
+        state_raw = np.zeros(8, dtype=np.float32)
+        state_raw[:7] = qpos[:7]
+        state_raw[7] = qpos[7]
+        current_joints = qpos[:7].copy()
         state = np.zeros(32, dtype=np.float32)
-        state[:7] = qpos[:7]
-        state[7:8] = qpos[7:8]
+        state[:8] = state_raw
 
     return {
-        "head_cam": head_rgb,      # (224, 224, 3) uint8
-        "left_cam": left_rgb,      # (224, 224, 3) uint8
-        "right_cam": right_rgb,    # (224, 224, 3) uint8
-        "state": state,            # (32,) float32
-        "qpos": qpos,              # (16,) original RoboTwin qpos
+        "head_cam": head_rgb,
+        "left_cam": left_rgb,
+        "right_cam": right_rgb,
+        "state": state,              # (32,) normalized state
+        "current_joints": current_joints,  # (7,) raw joints for delta computation
+        "qpos": qpos,                # (16,) original RoboTwin qpos
     }
 
 
 def get_model(usr_args: dict):
-    """
-    Initialize pi0 model for RoboTwin evaluation.
-
-    Args:
-        usr_args: Configuration dict containing:
-            - task_name: Task name
-            - ckpt_setting: Checkpoint setting/experiment name
-            - checkpoint_dir: Base directory for checkpoints
-            - device: CUDA device
-            - arm_mode: 'left', 'right', or 'both'
-            - embodiment: 'franka' or 'dual_arm' (auto-detected from left_arm_dim)
-    """
+    """Initialize pi0 model for RoboTwin evaluation."""
     global _model_instance
 
     # Construct checkpoint path
@@ -350,7 +409,7 @@ def get_model(usr_args: dict):
         os.path.join(checkpoint_dir, task_name, ckpt_setting),
         os.path.join(checkpoint_dir, ckpt_setting),
         os.path.join(checkpoint_dir, task_name, ckpt_setting, "model.safetensors"),
-        ckpt_setting,  # Direct path
+        ckpt_setting,
     ]
 
     checkpoint_path = None
@@ -368,15 +427,11 @@ def get_model(usr_args: dict):
             "\n".join(f"  - {p}" for p in possible_paths)
         )
 
-    # Auto-detect embodiment from arm dimensions
-    # franka-panda has 7 joints, aloha has 7+7=14
+    # Auto-detect embodiment
     left_arm_dim = usr_args.get('left_arm_dim', 7)
     right_arm_dim = usr_args.get('right_arm_dim', 7)
 
-    # Check if this is single-arm (franka) or dual-arm (aloha)
-    # If right_arm_dim exists and > 0, it's dual-arm
     if right_arm_dim > 0 and left_arm_dim > 0:
-        # Check the embodiment config name
         embodiment_name = usr_args.get('embodiment_name', '')
         if 'franka' in embodiment_name.lower():
             embodiment = 'franka'
@@ -385,7 +440,6 @@ def get_model(usr_args: dict):
     else:
         embodiment = 'franka'
 
-    # Allow explicit override
     embodiment = usr_args.get('embodiment', embodiment)
 
     print(f"Using embodiment: {embodiment} (left_arm_dim={left_arm_dim}, right_arm_dim={right_arm_dim})")
@@ -403,53 +457,66 @@ def get_model(usr_args: dict):
     return _model_instance
 
 
-def eval(TASK_ENV, model: Pi0InternPolicy, observation: dict):
-    """
-    Execute one evaluation step.
+_debug_step_count = 0
 
-    Args:
-        TASK_ENV: RoboTwin task environment
-        model: Pi0InternPolicy instance
-        observation: Current observation from TASK_ENV.get_obs()
-    """
+def eval(TASK_ENV, model: Pi0InternPolicy, observation: dict):
+    """Execute one evaluation step."""
+    global _debug_step_count
+
     # Encode observation
     obs = encode_obs(observation)
+
+    # Debug: print info for first few steps
+    if _debug_step_count < 3:
+        print(f"\n=== DEBUG Step {_debug_step_count} ===")
+        print(f"State (normalized, first 8): {obs['state'][:8]}")
+        print(f"Current joints: {obs['current_joints']}")
+        print(f"qpos from RoboTwin: {obs['qpos'][:8]}")
 
     # Get language instruction
     instruction = TASK_ENV.get_instruction()
 
     # Get action chunk from model
-    actions = model.predict(obs, instruction=instruction)  # (action_horizon, 14)
+    actions = model.predict(obs, instruction=instruction)
+
+    # Debug
+    if _debug_step_count < 3:
+        print(f"Actions shape: {actions.shape}")
+        print(f"First action (target joints): {actions[0, :7]}")
+        print(f"First action (gripper): {actions[0, 7]:.4f}")
+        print("=" * 50)
+
+    _debug_step_count += 1
 
     # Execute action chunk
     for action in actions:
         TASK_ENV.take_action(action, action_type='qpos')
 
-        # Check if task is done
         if TASK_ENV.eval_success:
             break
 
-        # Get new observation (for potential history update)
         observation = TASK_ENV.get_obs()
 
 
 def reset_model(model: Pi0InternPolicy):
     """Reset model state for new episode."""
+    global _debug_step_count
+    _debug_step_count = 0
     if model is not None:
         model.reset()
 
 
 # For direct testing
 if __name__ == "__main__":
-    print("Pi0 Intern Policy for RoboTwin")
+    print("Pi0 Intern Policy for RoboTwin (Delta Joints Format)")
     print("=" * 50)
     print(f"Script directory: {SCRIPT_DIR}")
     print(f"RoboTwin root: {ROBOTWIN_ROOT}")
     print(f"Repository root: {REPO_ROOT}")
 
-    # Test imports
     try:
         from openpi.models.tokenizer import PaligemmaTokenizer
-        print("Successfully imported PaligemmaTokenizer")
+        from openpi.training.intern_data_loader import NormStats, load_norm_stats
+        print("Successfully imported required modules")
     except ImportError as e:
         print(f"Import error: {e}")
