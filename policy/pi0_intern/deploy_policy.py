@@ -223,9 +223,18 @@ class Pi0InternPolicy:
         # Output 16-dim actions for RoboTwin
         robotwin_action = np.zeros(16, dtype=np.float32)
 
-        if self.arm_mode == 'left':
+        if self.embodiment == 'franka':
+            # For Franka single-arm: left and right entity are the SAME robot!
+            # Must set both sides to the same action, otherwise they conflict
             robotwin_action[:7] = target_joints
             robotwin_action[7] = gripper_action
+            robotwin_action[8:15] = target_joints  # Same as left!
+            robotwin_action[15] = gripper_action
+        elif self.arm_mode == 'left':
+            robotwin_action[:7] = target_joints
+            robotwin_action[7] = gripper_action
+            # Keep right arm at current position (don't set to 0!)
+            # Actually for dual-arm, we need to handle this differently
         elif self.arm_mode == 'right':
             robotwin_action[8:15] = target_joints
             robotwin_action[15] = gripper_action
@@ -534,8 +543,8 @@ def eval(TASK_ENV, model: Pi0InternPolicy, observation: dict):
 
         if model.norm_stats is not None:
             # Show denormalized state for clarity
-            state_min = model.norm_stats['states'].min[:8]
-            state_max = model.norm_stats['states'].max[:8]
+            state_min = model.norm_stats['state'].min[:8]
+            state_max = model.norm_stats['state'].max[:8]
             state_denorm = (obs['state'][:8] + 1) / 2 * (state_max - state_min) + state_min
             print(f"  State (denormalized): {state_denorm}")
 
