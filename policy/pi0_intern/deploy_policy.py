@@ -498,44 +498,94 @@ def get_model(usr_args: dict):
 
 
 _debug_step_count = 0
+_debug_save_dir = None
+_debug_detailed = os.environ.get('VLA_DEBUG', '0') == '1'  # Set VLA_DEBUG=1 for detailed debugging
 
 def eval(TASK_ENV, model: Pi0InternPolicy, observation: dict):
     """Execute one evaluation step."""
-    global _debug_step_count
+    global _debug_step_count, _debug_save_dir, _debug_detailed
+
+    # Create debug save directory on first step
+    if _debug_step_count == 0 and _debug_detailed:
+        import os
+        from datetime import datetime
+        _debug_save_dir = f"./debug_output/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        os.makedirs(_debug_save_dir, exist_ok=True)
+        print(f"\n{'='*60}")
+        print(f"DEBUG MODE: Saving detailed step info to {_debug_save_dir}")
+        print(f"{'='*60}\n")
 
     # Encode observation
     obs = encode_obs(observation)
 
-    # Debug: print info for first few steps
-    if _debug_step_count < 3:
-        print(f"\n=== DEBUG Step {_debug_step_count} ===")
-        print(f"State (normalized, first 8): {obs['state'][:8]}")
-        print(f"Current joints: {obs['current_joints']}")
-        print(f"qpos from RoboTwin: {obs['qpos'][:8]}")
-
     # Get language instruction
     instruction = TASK_ENV.get_instruction()
+
+    # Debug: print info for ALL steps when detailed mode is on
+    if _debug_detailed or _debug_step_count < 3:
+        print(f"\n{'='*60}")
+        print(f"=== STEP {_debug_step_count} ===")
+        print(f"{'='*60}")
+        print(f"Instruction: {instruction}")
+        print(f"\n[INPUT STATE]")
+        print(f"  State (normalized, first 8): {obs['state'][:8]}")
+        print(f"  Current joints (raw): {obs['current_joints']}")
+        print(f"  Full qpos from RoboTwin: {obs['qpos'][:8]}")
+
+        if model.norm_stats is not None:
+            # Show denormalized state for clarity
+            state_min = model.norm_stats['states'].min[:8]
+            state_max = model.norm_stats['states'].max[:8]
+            state_denorm = (obs['state'][:8] + 1) / 2 * (state_max - state_min) + state_min
+            print(f"  State (denormalized): {state_denorm}")
+
+    # Save images if detailed debug
+    if _debug_detailed and _debug_save_dir:
+        cv2.imwrite(f"{_debug_save_dir}/step{_debug_step_count:04d}_head.png",
+                    cv2.cvtColor(obs['head_cam'], cv2.COLOR_RGB2BGR))
+        cv2.imwrite(f"{_debug_save_dir}/step{_debug_step_count:04d}_left.png",
+                    cv2.cvtColor(obs['left_cam'], cv2.COLOR_RGB2BGR))
+        cv2.imwrite(f"{_debug_save_dir}/step{_debug_step_count:04d}_right.png",
+                    cv2.cvtColor(obs['right_cam'], cv2.COLOR_RGB2BGR))
 
     # Get action chunk from model
     actions = model.predict(obs, instruction=instruction)
 
-    # Debug
-    if _debug_step_count < 3:
-        print(f"Actions shape: {actions.shape}")
-        print(f"First action (target joints): {actions[0, :7]}")
-        print(f"First action (gripper): {actions[0, 7]:.4f}")
-        print("=" * 50)
+    # Debug: show predicted actions
+    if _debug_detailed or _debug_step_count < 3:
+        print(f"\n[MODEL OUTPUT]")
+        print(f"  Actions shape: {actions.shape}")
+        print(f"  Action chunk (first 3 steps):")
+        for i in range(min(3, len(actions))):
+            print(f"    [{i}] joints: {actions[i, :7]}, gripper: {actions[i, 7]:.4f}")
 
     _debug_step_count += 1
 
-    # Execute action chunk
+    # Execute action chunk with detailed logging
+    action_idx = 0
     for action in actions:
+        if _debug_detailed:
+            # Get state BEFORE action
+            pre_qpos = np.array(TASK_ENV.get_obs()["joint_action"]["vector"], dtype=np.float32)
+            print(f"\n  [EXEC {action_idx}] Pre-action qpos[:8]:  {pre_qpos[:8]}")
+            print(f"  [EXEC {action_idx}] Sending action[:8]:    {action[:8]}")
+
         TASK_ENV.take_action(action, action_type='qpos')
 
+        if _debug_detailed:
+            # Get state AFTER action
+            post_obs = TASK_ENV.get_obs()
+            post_qpos = np.array(post_obs["joint_action"]["vector"], dtype=np.float32)
+            delta = post_qpos[:8] - pre_qpos[:8]
+            print(f"  [EXEC {action_idx}] Post-action qpos[:8]: {post_qpos[:8]}")
+            print(f"  [EXEC {action_idx}] Actual delta[:8]:     {delta}")
+
         if TASK_ENV.eval_success:
+            print(f"\n*** SUCCESS at step {_debug_step_count}, action {action_idx} ***")
             break
 
         observation = TASK_ENV.get_obs()
+        action_idx += 1
 
 
 def reset_model(model: Pi0InternPolicy):

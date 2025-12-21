@@ -132,7 +132,10 @@ class Robot:
                 self.right_conn.send({"cmd": "reset"})
                 _ = self.right_conn.recv()
         else:
-            if not isinstance(self.left_planner, CuroboPlanner) or not isinstance(self.right_planner, CuroboPlanner):
+            # Check if planners exist and are CuroboPlanner instances
+            left_planner = getattr(self, 'left_planner', None)
+            right_planner = getattr(self, 'right_planner', None)
+            if not isinstance(left_planner, CuroboPlanner) or not isinstance(right_planner, CuroboPlanner):
                 self.set_planner(scene=scene)
 
         self.init_joints()
