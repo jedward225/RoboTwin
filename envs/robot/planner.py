@@ -275,6 +275,14 @@ except Exception as e:
     print('Exception traceback:')
     traceback.print_exc()
 
+    # Placeholder when Curobo is not available
+    class CuroboPlanner:
+        """Placeholder class when Curobo is not installed."""
+        def __init__(self, *args, **kwargs):
+            raise NotImplementedError(
+                "CuroboPlanner requires Curobo. Install from https://github.com/NVlabs/curobo"
+            )
+
 
 # ********************** MplibPlanner **********************
 class MplibPlanner:

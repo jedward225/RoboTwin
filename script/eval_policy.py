@@ -154,6 +154,8 @@ def main(usr_args):
     args["policy_name"] = policy_name
     usr_args["left_arm_dim"] = len(args["left_embodiment_config"]["arm_joints_name"][0])
     usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
+    usr_args["embodiment"] = args.get("embodiment")  # Pass embodiment config to policy
+    usr_args["embodiment_name"] = embodiment_name
 
     seed = usr_args["seed"]
 

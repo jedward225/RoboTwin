@@ -1,7 +1,7 @@
 # Franka Panda configuration for InternData-trained models
 # Based on demo_clean.yml but using franka-panda embodiment
-render_freq: 0
-episode_num: 50
+render_freq: 1
+episode_num: 5
 use_seed: false
 save_freq: 15
 embodiment: [franka-panda]

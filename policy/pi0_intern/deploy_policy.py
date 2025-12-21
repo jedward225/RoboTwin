@@ -297,6 +297,14 @@ class Pi0InternPolicy:
         # Convert to numpy
         actions_np = actions.cpu().numpy()[0]  # (action_horizon, 32)
 
+        # DEBUG: Print raw model output
+        if not hasattr(self, '_debug_count'):
+            self._debug_count = 0
+        if self._debug_count < 3:
+            print(f"\n=== Model Output Debug (step {self._debug_count}) ===")
+            print(f"Raw model output (first 8): {actions_np[0, :8]}")
+            print(f"Raw model output range: [{actions_np[0, :8].min():.4f}, {actions_np[0, :8].max():.4f}]")
+
         # Process each action: denormalize and convert delta to absolute
         robotwin_actions = []
         running_joints = current_joints.copy()
@@ -304,6 +312,13 @@ class Pi0InternPolicy:
         for i in range(self.action_horizon):
             # Denormalize action
             delta_action = self._denormalize_action(actions_np[i])
+
+            # DEBUG: Print denormalized delta
+            if self._debug_count < 3 and i == 0:
+                print(f"Denormalized delta (first 8): {delta_action}")
+                print(f"Current joints: {running_joints}")
+                print(f"Target = current + delta: {running_joints + delta_action[:7]}")
+                self._debug_count += 1
 
             # Convert delta to absolute
             robotwin_action = self._delta_to_robotwin_action(delta_action, running_joints)
@@ -427,20 +442,45 @@ def get_model(usr_args: dict):
             "\n".join(f"  - {p}" for p in possible_paths)
         )
 
-    # Auto-detect embodiment
+    # Auto-detect embodiment from config
     left_arm_dim = usr_args.get('left_arm_dim', 7)
     right_arm_dim = usr_args.get('right_arm_dim', 7)
 
-    if right_arm_dim > 0 and left_arm_dim > 0:
-        embodiment_name = usr_args.get('embodiment_name', '')
-        if 'franka' in embodiment_name.lower():
-            embodiment = 'franka'
-        else:
-            embodiment = 'dual_arm'
+    # Check embodiment config - can be a list like ['franka-panda'] or a string
+    embodiment_config = usr_args.get('embodiment', None)
+    embodiment_name = usr_args.get('embodiment_name', '')
+
+    # Extract embodiment name from config (handles list format from yml)
+    if embodiment_config is not None:
+        if isinstance(embodiment_config, list):
+            # Config format: embodiment: [franka-panda] or [aloha-left, aloha-right, 0.5]
+            embodiment_name = str(embodiment_config[0]) if embodiment_config else ''
+        elif isinstance(embodiment_config, str):
+            # Direct string: embodiment: franka
+            if embodiment_config in ['franka', 'dual_arm']:
+                # Already the target format
+                embodiment = embodiment_config
+                print(f"Using embodiment: {embodiment} (left_arm_dim={left_arm_dim}, right_arm_dim={right_arm_dim})")
+                _model_instance = Pi0InternPolicy(
+                    checkpoint_path=checkpoint_path,
+                    device=usr_args.get('device', 'cuda:0'),
+                    action_horizon=usr_args.get('action_horizon', 10),
+                    action_dim=usr_args.get('action_dim', 32),
+                    max_token_len=usr_args.get('max_token_len', 48),
+                    arm_mode=usr_args.get('arm_mode', 'left'),
+                    embodiment=embodiment,
+                )
+                return _model_instance
+            else:
+                embodiment_name = embodiment_config
+
+    # Determine embodiment based on name
+    if 'franka' in embodiment_name.lower():
+        embodiment = 'franka'
+    elif right_arm_dim > 0 and left_arm_dim > 0:
+        embodiment = 'dual_arm'
     else:
         embodiment = 'franka'
-
-    embodiment = usr_args.get('embodiment', embodiment)
 
     print(f"Using embodiment: {embodiment} (left_arm_dim={left_arm_dim}, right_arm_dim={right_arm_dim})")
 
