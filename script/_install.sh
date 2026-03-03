@@ -51,8 +51,9 @@ sed -i -E 's/(if np.linalg.norm\(delta_twist\) < 1e-4 )(or collide )(or not with
 echo "Installing Curobo ..."
 cd envs
 git clone https://github.com/NVlabs/curobo.git
+conda install -c nvidia cuda-toolkit=12.1
 cd curobo
-pip install -e . --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install -e . --no-build-isolation
 cd ../..
 
 echo "Installation basic environment complete!"
