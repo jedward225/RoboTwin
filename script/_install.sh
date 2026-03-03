@@ -1,5 +1,5 @@
 echo "Installing the necessary packages ..."
-pip install -r script/requirements.txt
+pip install -r script/requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 echo "Installing pytorch3d ..."
 # cd third_party/pytorch3d_simplified
@@ -51,7 +51,7 @@ echo "Installing Curobo ..."
 cd envs
 git clone https://github.com/NVlabs/curobo.git
 cd curobo
-pip install -e . --no-build-isolation
+pip install -e . --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple
 cd ../..
 
 echo "Installation basic environment complete!"
